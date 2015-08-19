@@ -1,8 +1,8 @@
-/* 
+/*
  Esp.cpp - ESP8266-specific APIs
  Copyright (c) 2015 Ivan Grokhotkov. All rights reserved.
  This file is part of the esp8266 core for Arduino environment.
- 
+
  This library is free software; you can redistribute it and/or
  modify it under the terms of the GNU Lesser General Public
  License as published by the Free Software Foundation; either
@@ -19,17 +19,20 @@
  */
 
 #include "Arduino.h"
+#include "flash_utils.h"
+#include "eboot_command.h"
+#include <memory>
+#include "interrupts.h"
 
 extern "C" {
 #include "user_interface.h"
+
+extern struct rst_info resetInfo;
 }
 
-//extern "C" void ets_wdt_init(uint32_t val);
-extern "C" void ets_wdt_enable(void);
-extern "C" void ets_wdt_disable(void);
-extern "C" void wdt_feed(void) {
-    
-}
+
+//#define DEBUG_SERIAL Serial
+
 
 /**
  * User-defined Literals
@@ -77,15 +80,10 @@ unsigned long long operator"" _GB(unsigned long long x) {
 
 EspClass ESP;
 
-EspClass::EspClass()
-{
-
-}
-
 void EspClass::wdtEnable(uint32_t timeout_ms)
 {
-    //todo find doku for ets_wdt_init may set the timeout
-	ets_wdt_enable();
+    /// This API can only be called if software watchdog is stopped
+    system_soft_wdt_restart();
 }
 
 void EspClass::wdtEnable(WDTO_t timeout_ms)
@@ -95,32 +93,40 @@ void EspClass::wdtEnable(WDTO_t timeout_ms)
 
 void EspClass::wdtDisable(void)
 {
-	ets_wdt_disable();
+    /// Please don't stop software watchdog too long (less than 6 seconds),
+    /// otherwise it will trigger hardware watchdog reset.
+    system_soft_wdt_stop();
 }
 
 void EspClass::wdtFeed(void)
 {
-	wdt_feed();
+    system_soft_wdt_feed();
 }
+
+extern "C" void esp_yield();
 
 void EspClass::deepSleep(uint32_t time_us, WakeMode mode)
 {
-	system_deep_sleep_set_option(static_cast<int>(mode));
- 	system_deep_sleep(time_us);
+    system_deep_sleep_set_option(static_cast<int>(mode));
+    system_deep_sleep(time_us);
+    esp_yield();
 }
 
+extern "C" void __real_system_restart_local();
 void EspClass::reset(void)
 {
-	((void (*)(void))0x40000080)();
+    __real_system_restart_local();
 }
 
 void EspClass::restart(void)
 {
     system_restart();
+    esp_yield();
 }
 
 uint16_t EspClass::getVcc(void)
 {
+    InterruptLock lock;
     return system_get_vdd33();
 }
 
@@ -278,4 +284,142 @@ uint32_t EspClass::getFlashChipSizeByChipId(void) {
         default:
             return 0;
     }
+}
+
+String EspClass::getResetInfo(void) {
+    if(resetInfo.reason != 0) {
+        char buff[200];
+        sprintf(&buff[0], "Fatal exception:%d flag:%d (%s) epc1:0x%08x epc2:0x%08x epc3:0x%08x excvaddr:0x%08x depc:0x%08x", resetInfo.exccause, resetInfo.reason, (resetInfo.reason == 0 ? "DEFAULT" : resetInfo.reason == 1 ? "WDT" : resetInfo.reason == 2 ? "EXCEPTION" : resetInfo.reason == 3 ? "SOFT_WDT" : resetInfo.reason == 4 ? "SOFT_RESTART" : resetInfo.reason == 5 ? "DEEP_SLEEP_AWAKE" : "???"), resetInfo.epc1, resetInfo.epc2, resetInfo.epc3, resetInfo.excvaddr, resetInfo.depc);
+        return String(buff);
+    }
+    return String("flag: 0");
+}
+
+struct rst_info * EspClass::getResetInfoPtr(void) {
+    return &resetInfo;
+}
+
+bool EspClass::eraseConfig(void) {
+    bool ret = true;
+    size_t cfgAddr = (ESP.getFlashChipSize() - 0x4000);
+    size_t cfgSize = (8*1024);
+
+    noInterrupts();
+    while(cfgSize) {
+
+        if(spi_flash_erase_sector((cfgAddr / SPI_FLASH_SEC_SIZE)) != SPI_FLASH_RESULT_OK) {
+            ret = false;
+        }
+
+        cfgSize -= SPI_FLASH_SEC_SIZE;
+        cfgAddr += SPI_FLASH_SEC_SIZE;
+    }
+    interrupts();
+
+    return ret;
+}
+
+uint32_t EspClass::getSketchSize() {
+    static uint32_t result = 0;
+    if (result)
+        return result;
+
+    image_header_t image_header;
+    uint32_t pos = APP_START_OFFSET;
+    if (spi_flash_read(pos, (uint32_t*) &image_header, sizeof(image_header))) {
+        return 0;
+    }
+    pos += sizeof(image_header);
+#ifdef DEBUG_SERIAL
+    DEBUG_SERIAL.printf("num_segments=%u\r\n", image_header.num_segments);
+#endif
+    for (uint32_t section_index = 0;
+        section_index < image_header.num_segments;
+        ++section_index)
+    {
+        section_header_t section_header = {0};
+        if (spi_flash_read(pos, (uint32_t*) &section_header, sizeof(section_header))) {
+            return 0;
+        }
+        pos += sizeof(section_header);
+        pos += section_header.size;
+#ifdef DEBUG_SERIAL
+        DEBUG_SERIAL.printf("section=%u size=%u pos=%u\r\n", section_index, section_header.size, pos);
+#endif
+    }
+    result = pos;
+    return result;
+}
+
+extern "C" uint32_t _SPIFFS_start;
+
+uint32_t EspClass::getFreeSketchSpace() {
+
+    uint32_t usedSize = getSketchSize();
+    // round one sector up
+    uint32_t freeSpaceStart = (usedSize + FLASH_SECTOR_SIZE - 1) & (~(FLASH_SECTOR_SIZE - 1));
+    uint32_t freeSpaceEnd = (uint32_t)&_SPIFFS_start - 0x40200000;
+
+#ifdef DEBUG_SERIAL
+    DEBUG_SERIAL.printf("usedSize=%u freeSpaceStart=%u freeSpaceEnd=%u\r\n", usedSize, freeSpaceStart, freeSpaceEnd);
+#endif
+    return freeSpaceEnd - freeSpaceStart;
+}
+
+bool EspClass::updateSketch(Stream& in, uint32_t size, bool restartOnFail, bool restartOnSuccess) {
+  if(!Update.begin(size)){
+#ifdef DEBUG_SERIAL
+    DEBUG_SERIAL.print("Update ");
+    Update.printError(DEBUG_SERIAL);
+#endif
+    if(restartOnFail) ESP.restart();
+    return false;
+  }
+
+  if(Update.writeStream(in) != size){
+#ifdef DEBUG_SERIAL
+    DEBUG_SERIAL.print("Update ");
+    Update.printError(DEBUG_SERIAL);
+#endif
+    if(restartOnFail) ESP.restart();
+    return false;
+  }
+
+  if(!Update.end()){
+#ifdef DEBUG_SERIAL
+    DEBUG_SERIAL.print("Update ");
+    Update.printError(DEBUG_SERIAL);
+#endif
+    if(restartOnFail) ESP.restart();
+    return false;
+  }
+
+#ifdef DEBUG_SERIAL
+    DEBUG_SERIAL.println("Update SUCCESS");
+#endif
+    if(restartOnSuccess) ESP.restart();
+    return true;
+}
+
+static const int FLASH_INT_MASK = ((B10 << 8) | B00111010);
+
+bool EspClass::flashEraseSector(uint32_t sector) {
+    ets_isr_mask(FLASH_INT_MASK);
+    int rc = spi_flash_erase_sector(sector);
+    ets_isr_unmask(FLASH_INT_MASK);
+    return rc == 0;
+}
+
+bool EspClass::flashWrite(uint32_t offset, uint32_t *data, size_t size) {
+    ets_isr_mask(FLASH_INT_MASK);
+    int rc = spi_flash_write(offset, (uint32_t*) data, size);
+    ets_isr_unmask(FLASH_INT_MASK);
+    return rc == 0;
+}
+
+bool EspClass::flashRead(uint32_t offset, uint32_t *data, size_t size) {
+    ets_isr_mask(FLASH_INT_MASK);
+    int rc = spi_flash_read(offset, (uint32_t*) data, size);
+    ets_isr_unmask(FLASH_INT_MASK);
+    return rc == 0;
 }

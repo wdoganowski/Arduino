@@ -35,11 +35,8 @@ extern "C" {
 
 #include "stdlib_noniso.h"
 #include "binary.h"
-#include "pgmspace.h"
 #include "esp8266_peri.h"
 #include "twi.h"
-
-void yield(void);
 
 #define HIGH 0x1
 #define LOW  0x0
@@ -49,9 +46,11 @@ void yield(void);
 //GPIO FUNCTIONS
 #define INPUT             0x00
 #define INPUT_PULLUP      0x02
-#define INPUT_PULLDOWN    0x04
+#define INPUT_PULLDOWN_16 0x04 // PULLDOWN only possible for pin16
 #define OUTPUT            0x01
 #define OUTPUT_OPEN_DRAIN 0x03
+#define WAKEUP_PULLUP     0x05
+#define WAKEUP_PULLDOWN   0x07
 #define SPECIAL           0xF8 //defaults to the usable BUSes uart0rx/tx uart1tx and hspi
 #define FUNCTION_0        0x08
 #define FUNCTION_1        0x18
@@ -100,12 +99,28 @@ void yield(void);
 #define timer1_enabled()        ((T1C & (1 << TCTE)) != 0)
 #define timer1_interrupted()    ((T1C & (1 << TCIS)) != 0)
 
+typedef void(*timercallback)(void);
+
 void timer1_isr_init(void);
 void timer1_enable(uint8_t divider, uint8_t int_type, uint8_t reload);
 void timer1_disable(void);
-void timer1_attachInterrupt(void (*userFunc)(void));
+void timer1_attachInterrupt(timercallback userFunc);
 void timer1_detachInterrupt(void);
 void timer1_write(uint32_t ticks); //maximum ticks 8388607
+
+// timer0 is a special CPU timer that has very high resolution but with
+// limited control.
+// it uses CCOUNT (ESP.GetCycleCount()) as the non-resetable timer counter
+// it does not support divide, type, or reload flags
+// it is auto-disabled when the compare value matches CCOUNT
+// it is auto-enabled when the compare value changes
+#define timer0_interrupted()    (ETS_INTR_PENDING() & (_BV(ETS_COMPARE0_INUM)))
+#define timer0_read() ((__extension__({uint32_t count;__asm__ __volatile__("esync; rsr %0,ccompare0":"=a" (count));count;})))
+#define timer0_write(count) __asm__ __volatile__("wsr %0,ccompare0; esync"::"a" (count) : "memory")
+
+void timer0_isr_init(void);
+void timer0_attachInterrupt(timercallback userFunc);
+void timer0_detachInterrupt(void);
 
 // undefine stdlib's abs if encountered
 #ifdef abs
@@ -122,17 +137,29 @@ void timer1_write(uint32_t ticks); //maximum ticks 8388607
 void ets_intr_lock();
 void ets_intr_unlock();
 
-// level (0-15), 
-// level 15 will disable ALL interrupts, 
-// level 0 will disable most software interrupts
+#ifndef __STRINGIFY
+#define __STRINGIFY(a) #a
+#endif
+
+// these low level routines provide a replacement for SREG interrupt save that AVR uses
+// but are esp8266 specific. A normal use pattern is like
 //
-#define xt_disable_interrupts(state, level) __asm__ __volatile__("rsil %0," __STRINGIFY(level) "; esync; isync; dsync" : "=a" (state))
-#define xt_enable_interrupts(state)  __asm__ __volatile__("wsr %0,ps; esync" :: "a" (state) : "memory")
+//{
+//    uint32_t savedPS = xt_rsil(1); // this routine will allow level 2 and above
+//    // do work here
+//    xt_wsr_ps(savedPS); // restore the state
+//}
+//
+// level (0-15), interrupts of the given level and above will be active
+// level 15 will disable ALL interrupts,
+// level 0 will enable ALL interrupts,
+// 
+#define xt_rsil(level) (__extension__({uint32_t state; __asm__ __volatile__("rsil %0," __STRINGIFY(level) : "=a" (state)); state;}))
+#define xt_wsr_ps(state)  __asm__ __volatile__("wsr %0,ps; isync" :: "a" (state) : "memory")
 
-extern uint32_t interruptsState;
+#define interrupts() xt_rsil(0)
+#define noInterrupts() xt_rsil(15)
 
-#define interrupts() xt_enable_interrupts(interruptsState)
-#define noInterrupts() __asm__ __volatile__("rsil %0,15; esync; isync; dsync" : "=a" (interruptsState))
 
 #define clockCyclesPerMicrosecond() ( F_CPU / 1000000L )
 #define clockCyclesToMicroseconds(a) ( (a) / clockCyclesPerMicrosecond() )
@@ -164,33 +191,39 @@ void initVariant(void);
 
 int atexit(void (*func)()) __attribute__((weak));
 
-void pinMode(uint8_t, uint8_t);
-void digitalWrite(uint8_t, uint8_t);
-int digitalRead(uint8_t);
-int analogRead(uint8_t);
+void pinMode(uint8_t pin, uint8_t mode);
+void digitalWrite(uint8_t pin, uint8_t val);
+int digitalRead(uint8_t pin);
+int analogRead(uint8_t pin);
 void analogReference(uint8_t mode);
-void analogWrite(uint8_t, int);
+void analogWrite(uint8_t pin, int val);
 void analogWriteFreq(uint32_t freq);
+void analogWriteRange(uint32_t range);
 
 unsigned long millis(void);
 unsigned long micros(void);
 void delay(unsigned long);
 void delayMicroseconds(unsigned int us);
 unsigned long pulseIn(uint8_t pin, uint8_t state, unsigned long timeout);
+unsigned long pulseInLong(uint8_t pin, uint8_t state, unsigned long timeout);
 
 void shiftOut(uint8_t dataPin, uint8_t clockPin, uint8_t bitOrder, uint8_t val);
 uint8_t shiftIn(uint8_t dataPin, uint8_t clockPin, uint8_t bitOrder);
 
-void attachInterrupt(uint8_t, void (*)(void), int mode);
-void detachInterrupt(uint8_t);
+void attachInterrupt(uint8_t pin, void (*)(void), int mode);
+void detachInterrupt(uint8_t pin);
 
 void setup(void);
 void loop(void);
+
+void yield(void);
+void optimistic_yield(uint32_t interval_us);
 
 // Get the bit location within the hardware port of the given virtual pin.
 // This comes from the pins_*.c file for the active board configuration.
 #define digitalPinToPort(pin)       (0)
 #define digitalPinToBitMask(pin)    (1UL << (pin))
+#define digitalPinToTimer(pin)      (0)
 #define portOutputRegister(port)    ((volatile uint32_t*) GPO)
 #define portInputRegister(port)     ((volatile uint32_t*) GPI)
 #define portModeRegister(port)      ((volatile uint32_t*) GPE)
@@ -198,6 +231,7 @@ void loop(void);
 #define NOT_A_PIN -1
 #define NOT_A_PORT -1
 #define NOT_AN_INTERRUPT -1
+#define NOT_ON_TIMER 0
 
 #ifdef __cplusplus
 } // extern "C"
@@ -205,15 +239,20 @@ void loop(void);
 
 #ifdef __cplusplus
 
+#include "pgmspace.h"
+
 #include "WCharacter.h"
 #include "WString.h"
 
 #include "HardwareSerial.h"
 #include "Esp.h"
+#include "Updater.h"
 #include "debug.h"
 
 #define min(a,b) ((a)<(b)?(a):(b))
 #define max(a,b) ((a)>(b)?(a):(b))
+#define _min(a,b) ((a)<(b)?(a):(b))
+#define _max(a,b) ((a)>(b)?(a):(b))
 
 uint16_t makeWord(uint16_t w);
 uint16_t makeWord(byte h, byte l);
@@ -221,6 +260,7 @@ uint16_t makeWord(byte h, byte l);
 #define word(...) makeWord(__VA_ARGS__)
 
 unsigned long pulseIn(uint8_t pin, uint8_t state, unsigned long timeout = 1000000L);
+unsigned long pulseInLong(uint8_t pin, uint8_t state, unsigned long timeout = 1000000L);
 
 void tone(uint8_t _pin, unsigned int frequency, unsigned long duration = 0);
 void noTone(uint8_t _pin);
@@ -228,7 +268,7 @@ void noTone(uint8_t _pin);
 // WMath prototypes
 long random(long);
 long random(long, long);
-void randomSeed(unsigned int);
+void randomSeed(unsigned long);
 long map(long, long, long, long, long);
 
 

@@ -26,11 +26,12 @@
 #include "Client.h"
 #include "IPAddress.h"
 #include <memory>
+#include "include/slist.h"
 
 class ClientContext;
 class WiFiServer;
 
-class WiFiClient : public Client {
+class WiFiClient : public Client, public SList<WiFiClient> {
 protected:
   WiFiClient(ClientContext* client);
 
@@ -59,6 +60,8 @@ public:
 
   IPAddress remoteIP();
   uint16_t  remotePort();
+  IPAddress localIP();
+  uint16_t  localPort();
   bool getNoDelay();
   void setNoDelay(bool nodelay);
   static void setLocalPortStart(uint16_t port) { _localPort = port; }
@@ -89,6 +92,8 @@ public:
 
   using Print::write;
 
+  static void stopAll();
+
 private:
 
   static int8_t _s_connected(void* arg, void* tpcb, int8_t err);
@@ -99,7 +104,6 @@ private:
 
   ClientContext* _client;
   static uint16_t _localPort;
-
 };
 
 

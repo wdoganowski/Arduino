@@ -32,6 +32,9 @@ extern "C" {
 #include "WiFiClient.h"
 #include "WiFiServer.h"
 
+#define WIFI_SCAN_RUNNING   (-1)
+#define WIFI_SCAN_FAILD     (-2)
+
 enum WiFiMode { WIFI_OFF = 0, WIFI_STA = 1, WIFI_AP = 2, WIFI_AP_STA = 3 };
 
 class ESP8266WiFiClass
@@ -41,7 +44,7 @@ public:
     ESP8266WiFiClass();
 
     void mode(WiFiMode);
-        
+
     /**
      * Start Wifi connection
      * if passphrase is set the most secure supported mode will be automatically selected
@@ -72,9 +75,9 @@ public:
      * param ssid: Pointer to the SSID string.
      * param passphrase: Pointer to passphrase, 8 characters min.
      * param channel: WiFi channel number, 1 - 13.
+     * param ssid_hidden: Network cloaking? 0 = broadcast SSID, 1 = hide SSID
      */
-    void softAP(const char* ssid, const char* passphrase, int channel = 1);
-
+    void softAP(const char* ssid, const char* passphrase, int channel = 1, int ssid_hidden = 0);
 
     /* Change Ip configuration settings disabling the dhcp client
         *
@@ -83,6 +86,15 @@ public:
         * param subnet:		Static Subnet mask
         */
     void config(IPAddress local_ip, IPAddress gateway, IPAddress subnet);
+
+	/* Change Ip configuration settings disabling the dhcp client
+        *
+        * param local_ip: 	Static ip configuration
+        * param gateway: 	Static gateway configuration
+        * param subnet:		Static Subnet mask
+		* param dns: 		Defined DNS
+        */
+    void config(IPAddress local_ip, IPAddress gateway, IPAddress subnet, IPAddress dns);
 
     /* Configure access point
      *
@@ -93,25 +105,36 @@ public:
     void softAPConfig(IPAddress local_ip, IPAddress gateway, IPAddress subnet);
 
     /*
+      * Disconnect from the network (close AP)
+      *
+      * return: one value of wl_status_t enum
+      */
+    int softAPdisconnect(bool wifioff = false);
+
+    /*
      * Disconnect from the network
      *
      * return: one value of wl_status_t enum
      */
-    int disconnect(void);
+    int disconnect(bool wifioff = false);
 
     /*
      * Get the station interface MAC address.
      *
      * return: pointer to uint8_t array with length WL_MAC_ADDR_LENGTH
+     * return: String
      */
     uint8_t* macAddress(uint8_t* mac);
+    String macAddress(void);
 
     /*
      * Get the softAP interface MAC address.
      *
      * return: pointer to uint8_t array with length WL_MAC_ADDR_LENGTH
+     * return: String
      */
     uint8_t* softAPmacAddress(uint8_t* mac);
+    String softAPmacAddress(void);
 
     /*
      * Get the station interface IP address.
@@ -151,9 +174,16 @@ public:
     /*
      * Return the current bssid / mac associated with the network if configured
      *
-     * return: bssid string
+     * return: bssid uint8_t *
      */
     uint8_t * BSSID(void);
+
+    /*
+     * Return the current bssid / mac associated with the network if configured
+     *
+     * return: bssid string
+     */
+    String BSSIDstr(void);
 
     /*
      * Return the current channel associated with the network
@@ -163,20 +193,33 @@ public:
     int32_t channel(void);
 
     /*
-     * Return the current network RSSI. Note: this is just a stub, there is no way to
-     *  get the RSSI in the Espressif SDK yet.
+     * Return the current network RSSI.
      *
-     * return: RSSI value (currently 0)
+     * return: RSSI value
      */
 
-    int32_t RSSI() { return 0; }
+    int32_t RSSI();
+
+
+    /*
+     * called to get the scan state in Async mode
+     *
+     * return -1 if scan not fin
+     * return -2 if scan not triggered
+     */
+    int8_t scanComplete();
+
+    /*
+     * delete last scan result from RAM
+     */
+    void scanDelete();
 
     /*
      * Start scan WiFi networks available
      *
      * return: Number of discovered networks
      */
-    int8_t scanNetworks();
+    int8_t scanNetworks(bool async = false);
 
     /*
      * Return the SSID discovered during the network scan.
@@ -209,9 +252,16 @@ public:
     /**
      * return MAC / BSSID of scanned wifi
      * @param networkItem specify from which network item want to get the information
-     * @return uint8_t * to MAC / BSSID of scanned wifi
+     * @return uint8_t * MAC / BSSID of scanned wifi
      */
     uint8_t * BSSID(uint8_t networkItem);
+
+    /**
+     * return MAC / BSSID of scanned wifi
+     * @param networkItem specify from which network item want to get the information
+     * @return String MAC / BSSID of scanned wifi
+     */
+    String BSSIDstr(uint8_t networkItem);
 
     /**
      * return channel of scanned wifi
@@ -258,6 +308,26 @@ public:
     int hostByName(const char* aHostname, IPAddress& aResult);
 
     /*
+     * Get ESP8266 station DHCP hostname
+     */
+    String hostname(void);
+
+    /*
+     * Set ESP8266 station DHCP hostname
+     * hostname, max length:32
+     */
+    bool hostname(char* aHostname);
+    bool hostname(const char* aHostname);
+    bool hostname(String aHostname);
+
+
+    /**
+     * WPS config
+     * so far only WPS_TYPE_PBC is supported (SDK 1.2.0)
+     */
+    bool beginWPSConfig(void);
+
+    /*
      * Output WiFi settings to an object derived from Print interface (like Serial).
      *
      */
@@ -266,33 +336,40 @@ public:
     /*
      * Start SmartConfig
      *
-     */ 
+     */
     void beginSmartConfig();
-    
+
     /*
      * Query SmartConfig status, to decide when stop config
      *
-     */    
+     */
     bool smartConfigDone();
 
     /*
      * Stop SmartConfig
      *
-     */ 
+     */
     void stopSmartConfig();
 
     friend class WiFiClient;
     friend class WiFiServer;
 
 protected:
+    void _mode(WiFiMode);
     static void _scanDone(void* result, int status);
     void * _getScanInfoByIndex(int i);
     static void _smartConfigCallback(uint32_t status, void* result);
-    bool _smartConfigStarted = false;
-    bool _smartConfigDone = false;
+    static void _eventCallback(void *event);
+    bool _smartConfigStarted;
+    bool _smartConfigDone;
 
     bool _useApMode;
     bool _useClientMode;
+	bool _useStaticIp;
+
+	static bool _scanAsync;
+	static bool _scanStarted;
+	static bool _scanComplete;
 
     static size_t _scanCount;
     static void* _scanResult;

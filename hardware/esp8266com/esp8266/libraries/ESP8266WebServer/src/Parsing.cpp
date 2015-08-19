@@ -1,8 +1,8 @@
-/* 
+/*
   Parsing.cpp - HTTP request parsing.
 
   Copyright (c) 2015 Ivan Grokhotkov. All rights reserved.
- 
+
   This library is free software; you can redistribute it and/or
   modify it under the terms of the GNU Lesser General Public
   License as published by the Free Software Foundation; either
@@ -24,8 +24,8 @@
 #include "WiFiClient.h"
 #include "ESP8266WebServer.h"
 
-// #define DEBUG
-#define DEBUG_OUTPUT Serial1
+#define DEBUG
+#define DEBUG_OUTPUT Serial
 
 bool ESP8266WebServer::_parseRequest(WiFiClient& client) {
   // Read the first line of HTTP request
@@ -43,7 +43,7 @@ bool ESP8266WebServer::_parseRequest(WiFiClient& client) {
 #endif
     return false;
   }
-  
+
   String methodStr = req.substring(0, addr_start);
   String url = req.substring(addr_start + 1, addr_end);
   String searchStr = "";
@@ -53,7 +53,7 @@ bool ESP8266WebServer::_parseRequest(WiFiClient& client) {
     url = url.substring(0, hasSearch);
   }
   _currentUri = url;
-  
+
   HTTPMethod method = HTTP_GET;
   if (methodStr == "POST") {
     method = HTTP_POST;
@@ -65,7 +65,7 @@ bool ESP8266WebServer::_parseRequest(WiFiClient& client) {
     method = HTTP_PATCH;
   }
   _currentMethod = method;
-  
+
 #ifdef DEBUG
   DEBUG_OUTPUT.print("method: ");
   DEBUG_OUTPUT.print(methodStr);
@@ -94,6 +94,14 @@ bool ESP8266WebServer::_parseRequest(WiFiClient& client) {
       }
       headerName = req.substring(0, headerDiv);
       headerValue = req.substring(headerDiv + 2);
+	  
+	  #ifdef DEBUG
+	  DEBUG_OUTPUT.print("headerName: ");
+	  DEBUG_OUTPUT.println(headerName);
+	  DEBUG_OUTPUT.print("headerValue: ");
+	  DEBUG_OUTPUT.println(headerValue);
+	  #endif
+	  
       if (headerName == "Content-Type"){
         if (headerValue.startsWith("text/plain")){
           isForm = false;
@@ -103,19 +111,66 @@ bool ESP8266WebServer::_parseRequest(WiFiClient& client) {
         }
       } else if (headerName == "Content-Length"){
         contentLength = headerValue.toInt();
+      } else if (headerName == "Host"){
+        _hostHeader = headerValue;
       }
     }
-  
+
     if (!isForm){
       if (searchStr != "") searchStr += '&';
-      searchStr += client.readStringUntil('\r');
-      client.readStringUntil('\n');
+      //some clients send headers first and data after (like we do)
+      //give them a chance
+      int tries = 100;//100ms max wait
+      while(!client.available() && tries--)delay(1);
+      size_t plainLen = client.available();
+      char *plainBuf = (char*)malloc(plainLen+1);
+      client.readBytes(plainBuf, plainLen);
+      plainBuf[plainLen] = '\0';
+#ifdef DEBUG
+      DEBUG_OUTPUT.print("Plain: ");
+      DEBUG_OUTPUT.println(plainBuf);
+#endif
+      if(plainBuf[0] == '{' || plainBuf[0] == '[' || strstr(plainBuf, "=") == NULL){
+        //plain post json or other data
+        searchStr += "plain=";
+        searchStr += plainBuf;
+      } else {
+        searchStr += plainBuf;
+      }
+      free(plainBuf);
     }
     _parseArguments(searchStr);
     if (isForm){
-      _parseForm(client, boundaryStr, contentLength);
+      if (!_parseForm(client, boundaryStr, contentLength)) {
+        return false;
+      }
     }
   } else {
+    String headerName;
+    String headerValue;
+    //parse headers
+    while(1){
+      req = client.readStringUntil('\r');
+      client.readStringUntil('\n');
+      if (req == "") break;//no moar headers
+      int headerDiv = req.indexOf(':');
+      if (headerDiv == -1){
+        break;
+      }
+      headerName = req.substring(0, headerDiv);
+      headerValue = req.substring(headerDiv + 2);
+	  
+	  #ifdef DEBUG
+	  DEBUG_OUTPUT.print("headerName: ");
+	  DEBUG_OUTPUT.println(headerName);
+	  DEBUG_OUTPUT.print("headerValue: ");
+	  DEBUG_OUTPUT.println(headerValue);
+	  #endif
+	  
+	  if (headerName == "Host"){
+        _hostHeader = headerValue;
+      }
+    }
     _parseArguments(searchStr);
   }
   client.flush();
@@ -224,8 +279,8 @@ uint8_t ESP8266WebServer::_uploadReadByte(WiFiClient& client){
   return (uint8_t)res;
 }
 
-void ESP8266WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
-  
+bool ESP8266WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
+
 #ifdef DEBUG
   DEBUG_OUTPUT.print("Parse Form: Boundary: ");
   DEBUG_OUTPUT.print(boundary);
@@ -233,7 +288,12 @@ void ESP8266WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t 
   DEBUG_OUTPUT.println(len);
 #endif
   String line;
-  line = client.readStringUntil('\r');
+  int retry = 0;
+  do {
+    line = client.readStringUntil('\r');
+    ++retry;
+  } while (line.length() == 0 && retry < 3);
+
   client.readStringUntil('\n');
   //start reading the form
   if (line == ("--"+boundary)){
@@ -245,7 +305,7 @@ void ESP8266WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t 
       String argType;
       String argFilename;
       bool argIsFile = false;
-      
+
       line = client.readStringUntil('\r');
       client.readStringUntil('\n');
       if (line.startsWith("Content-Disposition")){
@@ -296,11 +356,11 @@ void ESP8266WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t 
             DEBUG_OUTPUT.println(argValue);
             DEBUG_OUTPUT.println();
 #endif
-            
+
             RequestArgument& arg = postArgs[postArgsLen++];
             arg.key = argName;
             arg.value = argValue;
-            
+
             if (line == ("--"+boundary+"--")){
 #ifdef DEBUG
               DEBUG_OUTPUT.println("Done Parsing POST");
@@ -328,7 +388,7 @@ readfile:
               _uploadWriteByte(argByte);
               argByte = _uploadReadByte(client);
             }
-            
+
             argByte = _uploadReadByte(client);
             if (argByte == 0x0A){
               argByte = _uploadReadByte(client);
@@ -347,10 +407,10 @@ readfile:
                   goto readfile;
                 }
               }
-              
+
               uint8_t endBuf[boundary.length()];
               client.readBytes(endBuf, boundary.length());
-              
+
               if (strstr((const char*)endBuf, boundary.c_str()) != NULL){
                 if (_fileUploadHandler) _fileUploadHandler();
                 _currentUpload.totalSize += _currentUpload.currentSize;
@@ -394,7 +454,7 @@ readfile:
         }
       }
     }
-    
+
     int iarg;
     int totalArgs = ((32 - postArgsLen) < _currentArgCount)?(32 - postArgsLen):_currentArgCount;
     for (iarg = 0; iarg < totalArgs; iarg++){
@@ -411,7 +471,11 @@ readfile:
     }
     _currentArgCount = iarg;
     if (postArgs) delete[] postArgs;
+    return true;
   }
+#ifdef DEBUG
+  DEBUG_OUTPUT.print("Error: line: ");
+  DEBUG_OUTPUT.println(line);
+#endif
+  return false;
 }
-
-

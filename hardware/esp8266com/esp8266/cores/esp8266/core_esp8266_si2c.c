@@ -1,9 +1,9 @@
-/* 
+/*
   si2c.c - Software I2C library for esp8266
 
   Copyright (c) 2015 Hristo Gochkov. All rights reserved.
   This file is part of the esp8266 core for Arduino environment.
- 
+
   This library is free software; you can redistribute it and/or
   modify it under the terms of the GNU Lesser General Public
   License as published by the Free Software Foundation; either
@@ -26,10 +26,10 @@ unsigned char twi_dcount = 18;
 static unsigned char twi_sda, twi_scl;
 
 #define SDA_LOW()   (GPES = (1 << twi_sda)) //Enable SDA (becomes output and since GPO is 0 for the pin, it will pull the line low)
-#define SDA_HIGH()  (GPEC = (1 << twi_sda)) //Disable SDA (becomes input and since it has pullup it will go high) 
+#define SDA_HIGH()  (GPEC = (1 << twi_sda)) //Disable SDA (becomes input and since it has pullup it will go high)
 #define SDA_READ()  ((GPI & (1 << twi_sda)) != 0)
-#define SCL_LOW()   (GPES = (1 << twi_scl)) 
-#define SCL_HIGH()  (GPEC = (1 << twi_scl)) 
+#define SCL_LOW()   (GPES = (1 << twi_scl))
+#define SCL_HIGH()  (GPEC = (1 << twi_scl))
 #define SCL_READ()  ((GPI & (1 << twi_scl)) != 0)
 
 #ifndef FCPU80
@@ -37,24 +37,26 @@ static unsigned char twi_sda, twi_scl;
 #endif
 
 #if F_CPU == FCPU80
-#define TWI_CLOCK_STRETCH 200
+#define TWI_CLOCK_STRETCH 800
 #else
-#define TWI_CLOCK_STRETCH 400
+#define TWI_CLOCK_STRETCH 1600
 #endif
 
 void twi_setClock(unsigned int freq){
 #if F_CPU == FCPU80
-  if(freq <= 100000) twi_dcount = 18;//about 100KHz
+  if(freq <= 100000) twi_dcount = 19;//about 100KHz
   else if(freq <= 200000) twi_dcount = 8;//about 200KHz
-  else if(freq <= 300000) twi_dcount = 4;//about 300KHz
-  else if(freq <= 400000) twi_dcount = 2;//about 370KHz
-  else twi_dcount = 1;//about 450KHz
+  else if(freq <= 300000) twi_dcount = 3;//about 300KHz
+  else if(freq <= 400000) twi_dcount = 1;//about 400KHz
+  else twi_dcount = 1;//about 400KHz
 #else
   if(freq <= 100000) twi_dcount = 32;//about 100KHz
-  else if(freq <= 200000) twi_dcount = 16;//about 200KHz
+  else if(freq <= 200000) twi_dcount = 14;//about 200KHz
   else if(freq <= 300000) twi_dcount = 8;//about 300KHz
-  else if(freq <= 400000) twi_dcount = 4;//about 370KHz
-  else twi_dcount = 2;//about 450KHz
+  else if(freq <= 400000) twi_dcount = 5;//about 400KHz
+  else if(freq <= 500000) twi_dcount = 3;//about 500KHz
+  else if(freq <= 600000) twi_dcount = 2;//about 600KHz
+  else twi_dcount = 1;//about 700KHz
 #endif
 }
 
@@ -73,8 +75,11 @@ void twi_stop(void){
 
 static void twi_delay(unsigned char v){
   unsigned int i;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
   unsigned int reg;
   for(i=0;i<v;i++) reg = GPI;
+#pragma GCC diagnostic pop
 }
 
 static bool twi_write_start(void) {
@@ -97,7 +102,7 @@ static bool twi_write_stop(void){
   twi_delay(twi_dcount);
   SDA_HIGH();
   twi_delay(twi_dcount);
-  
+
   return true;
 }
 
@@ -109,7 +114,7 @@ static bool twi_write_bit(bool bit) {
   twi_delay(twi_dcount+1);
   SCL_HIGH();
   while (SCL_READ() == 0 && (i++) < TWI_CLOCK_STRETCH);// Clock stretching (up to 100us)
-  twi_delay(twi_dcount+1);
+  twi_delay(twi_dcount);
   return true;
 }
 
@@ -117,7 +122,7 @@ static bool twi_read_bit(void) {
   unsigned int i = 0;
   SCL_LOW();
   SDA_HIGH();
-  twi_delay(twi_dcount+1);
+  twi_delay(twi_dcount+2);
   SCL_HIGH();
   while (SCL_READ() == 0 && (i++) < TWI_CLOCK_STRETCH);// Clock stretching (up to 100us)
   bool bit = SDA_READ();
@@ -164,7 +169,8 @@ unsigned char twi_readFrom(unsigned char address, unsigned char* buf, unsigned i
   unsigned int i;
   if(!twi_write_start()) return 4;//line busy
   if(!twi_write_byte(((address << 1) | 1) & 0xFF)) return 2;//received NACK on transmit of address
-  for(i=0; i<len; i++) buf[i] = twi_read_byte(false);
+  for(i=0; i<(len-1); i++) buf[i] = twi_read_byte(false);
+  buf[len-1] = twi_read_byte(true);
   if(sendStop) twi_write_stop();
   i = 0;
   while(SDA_READ() == 0 && (i++) < 10){
